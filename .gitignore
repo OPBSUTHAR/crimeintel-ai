@@ -14,7 +14,12 @@ __pycache__/
 
 # Database
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 crimeintel.db
+crimeintel.db-wal
+crimeintel.db-shm
 
 # Frontend build outputs
 dist/
@@ -38,6 +43,9 @@ temp_register.json
 
 # Database
 backend/data/*.db
+backend/data/*.db-wal
+backend/data/*.db-shm
+backend/data/*.db-journal
 
 # Project report & diary – local only, stashed (keep in parent root, hide from Source Control)
 BCA-Project\ Report-Format.pdf
