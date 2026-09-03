@@ -266,7 +266,50 @@ async def download_evidence_file(
         file_name = record.get("file_name", "file")
         file_path = _resolve_evidence_file_path(file_url, file_name)
         if not file_path or not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="File not found on server")
+            # Generate placeholder file on-the-fly for seeded demo data (files were never physically stored)
+            # This avoids 404 noise in logs and lets UI preview work. Create temp placeholder.
+            import tempfile
+            import mimetypes
+            suffix = os.path.splitext(file_name or "file")[1].lower() or ".pdf"
+            # Normalize suffix for placeholder generation
+            if suffix not in (".pdf", ".jpg", ".jpeg", ".png", ".mp4"):
+                suffix = ".pdf"
+            if suffix in (".jpg", ".jpeg", ".png"):
+                # Return tiny 1x1 png placeholder
+                import base64
+                # 1x1 transparent png
+                png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                tmp.write(base64.b64decode(png_b64))
+                tmp.close()
+                file_path = tmp.name
+                mime, _ = mimetypes.guess_type(file_name or file_path)
+                response_headers = {"Content-Disposition": f"inline; filename={file_name}"}
+                return FileResponse(path=file_path, media_type=mime or "image/png", filename=file_name, headers=response_headers)
+            elif suffix == ".mp4":
+                # For video, return 404 with clearer message (frontend will show placeholder)
+                raise HTTPException(status_code=404, detail="Video preview not available for seeded data")
+            else:
+                # Generate simple PDF placeholder via fpdf2
+                try:
+                    from fpdf import FPDF
+                    pdf = FPDF()
+                    pdf.add_page()
+                    pdf.set_font("Helvetica", "B", 16)
+                    pdf.cell(0, 12, "CrimeIntel AI - Evidence Placeholder", align="C", new_x="LMARGIN", new_y="NEXT")
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.ln(4)
+                    pdf.multi_cell(0, 6, f"This is a placeholder for seeded demo evidence.\n\nEvidence ID: {evidence_id}\nFile: {file_name}\nCase file_url: {file_url}\n\nOriginal file was not physically stored with the demo seed.\nUpload a new file to see real storage.")
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+                    pdf.output(tmp.name)
+                    tmp.close()
+                    file_path = tmp.name
+                    mime = "application/pdf"
+                    response_headers = {"Content-Disposition": f"inline; filename={file_name}"}
+                    return FileResponse(path=file_path, media_type=mime, filename=file_name, headers=response_headers)
+                except Exception as gen_e:
+                    logger.warning(f"Failed to generate placeholder PDF for {evidence_id}: {gen_e}")
+                    raise HTTPException(status_code=404, detail="File not found on server")
 
         import mimetypes
         mime, _ = mimetypes.guess_type(file_name or file_path)

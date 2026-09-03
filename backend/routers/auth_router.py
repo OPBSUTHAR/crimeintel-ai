@@ -1,7 +1,8 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pathlib import Path as _Path
+from fastapi import APIRouter, Depends, HTTPException, Request, status, UploadFile, File, Form
 
 from middleware.auth_middleware import get_current_user, require_role
 from middleware.rate_limiter import rate_limiter
@@ -70,28 +71,46 @@ async def register(body: dict):
             if auth and hasattr(auth, "signup"):
                 res = await auth.signup(email=email, password=password, display_name=full_name)
                 auth_user_id = res.get("user_id") if isinstance(res, dict) else None
-        except Exception:
+        except Exception as e:
+            # signup failed due to duplicate - propagate as conflict
+            msg = str(e).lower()
+            if "already" in msg or "exists" in msg or "duplicate" in msg or "unique" in msg:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists. Please sign in.")
             auth_user_id = None
 
-        user_id = auth_user_id or _gen()
-        now = _dt.utcnow().isoformat()
-        pwd_hash = _hashlib.sha256(password.encode()).hexdigest()
-        # Users table schema uses badge_number for employee_id; department/designation stored in display_name suffix or ignored to avoid missing column error
-        row = {
-            "ROWID": user_id,
-            "user_id": user_id,
-            "display_name": full_name,
-            "email": email,
-            "badge_number": employee_id,
-            "role": "officer",
-            "phone": body.get("phone") or "",
-            "status": "pending_document",
-            "password_hash": pwd_hash,
-            "created_at": now,
-            "updated_at": now,
-        }
-        # Store department/designation as extra audit detail since ci_Users has no such columns
-        await db.insert("Users", row)
+        # If auth.signup already created the user (local_auth), it inserted ROWID=user_id
+        # In that case we only need to patch badge_number/phone/status and audit log, not re-insert
+        if auth_user_id:
+            # patch extra fields that local_auth.signup didn't set (badge_number, phone, pending_document status)
+            try:
+                await db.update("Users", auth_user_id, {
+                    "badge_number": employee_id,
+                    "phone": body.get("phone") or "",
+                    "status": "pending_document",
+                    "updated_at": _dt.utcnow().isoformat(),
+                })
+            except Exception:
+                pass  # best-effort, user already exists
+            user_id = auth_user_id
+            now = _dt.utcnow().isoformat()
+        else:
+            user_id = _gen()
+            now = _dt.utcnow().isoformat()
+            pwd_hash = _hashlib.sha256(password.encode()).hexdigest()
+            row = {
+                "ROWID": user_id,
+                "user_id": user_id,
+                "display_name": full_name,
+                "email": email,
+                "badge_number": employee_id,
+                "role": "officer",
+                "phone": body.get("phone") or "",
+                "status": "pending_document",
+                "password_hash": pwd_hash,
+                "created_at": now,
+                "updated_at": now,
+            }
+            await db.insert("Users", row)
         await db.insert("Audit_Logs", {
             "user_id": user_id,
             "action": "user.registered",
@@ -136,9 +155,28 @@ async def login(request: Request, body: LoginRequest):
             user=UserProfileResponse(**result["user"]),
         )
     except ValueError as e:
+        msg = str(e)
+        low = msg.lower()
+        # pending verification should be 403 with structured detail so frontend can redirect to /verify-identity
+        if "pending verification" in low or "pending_document" in low or "pending verification" in low:
+            # fetch user to get user_id/status for frontend redirect
+            try:
+                users = await db.query("Users", {"email": body.email})
+                u = users[0] if users else None
+                uid = (u.get("ROWID") or u.get("user_id")) if u else None
+                acct = (u.get("status") or "pending_document") if u else "pending_document"
+            except Exception:
+                uid = None
+                acct = "pending_document"
+            detail = {"message": msg, "user_id": uid, "account_status": acct.upper() if isinstance(acct, str) else acct}
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+        if "rejected" in low:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=msg)
+        if "suspended" in low or "disabled" in low:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=msg)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e),
+            detail=msg,
         )
     except Exception as e:
         logger.exception("Login failed: %s", e)
@@ -370,3 +408,176 @@ async def direct_reset_password(body: dict):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to reset password.",
         )
+
+
+# ---- Verification endpoints to satisfy frontend (were previously only in legacy app/auth.py) ----
+ALLOWED_MIME_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/jpg",
+}
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+
+@router.get(
+    "/verification-status/{user_id}",
+    summary="Get verification status for a user (public, used by IdentityVerificationPage)",
+)
+async def get_verification_status(user_id: str):
+    try:
+        user = await db.get("Users", user_id)
+        # fallback: try numeric id mapping like usr_006 -> 6
+        if not user and user_id.isdigit():
+            # search by badge? no, just return 404
+            pass
+        if not user:
+            # also try searching by user_id field via query for hex ids that may be stored as ROWID
+            # db.get already checks ROWID, so if not found, 404
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        # Determine storage document existence
+        storage_root = _Path(__file__).parent.parent / "storage" / "verification_documents"
+        candidates = [
+            storage_root / str(user_id),
+            storage_root / f"user_{user_id}",
+        ]
+        if isinstance(user_id, str) and user_id.startswith("usr_"):
+            try:
+                num = user_id.split("_")[1].lstrip("0") or "0"
+                candidates.append(storage_root / f"user_{num}")
+            except Exception:
+                pass
+        doc_attached = False
+        doc_file = None
+        for cand in candidates:
+            if cand.exists() and cand.is_dir():
+                try:
+                    files = [p for p in cand.iterdir() if p.is_file()]
+                    if files:
+                        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                        doc_file = files[0]
+                        doc_attached = True
+                        break
+                except Exception:
+                    continue
+        status_raw = (user.get("status") or "pending_document").lower()
+        # Map to frontend AccountStatus
+        if status_raw in ("active", "approved", "verified"):
+            account_status = "APPROVED"
+        elif status_raw in ("pending_document",):
+            account_status = "PENDING_DOCUMENT"
+        elif status_raw in ("pending_verification", "pending"):
+            account_status = "PENDING_VERIFICATION"
+        elif status_raw == "rejected":
+            account_status = "REJECTED"
+        elif status_raw == "suspended":
+            account_status = "SUSPENDED"
+        else:
+            account_status = "PENDING_DOCUMENT" if not doc_attached else "PENDING_VERIFICATION"
+
+        # Document status
+        document_status = None
+        document = None
+        if doc_attached and doc_file is not None:
+            if status_raw in ("pending_verification", "pending"):
+                document_status = "PENDING"
+            elif status_raw in ("active", "approved", "verified"):
+                document_status = "APPROVED"
+            elif status_raw == "rejected":
+                document_status = "REJECTED"
+            else:
+                document_status = "PENDING"
+            # build minimal document response compatible with frontend VerificationDocument
+            import mimetypes
+            document = {
+                "id": 1,
+                "user_id": user_id,
+                "document_type": "OTHER_GOVERNMENT_ID",
+                "original_filename": doc_file.name,
+                "stored_filename": doc_file.name,
+                "file_size": doc_file.stat().st_size,
+                "mime_type": mimetypes.guess_type(str(doc_file))[0] or "application/octet-stream",
+                "verification_status": document_status,
+                "uploaded_at": user.get("updated_at") or user.get("created_at") or "",
+            }
+        else:
+            # no document yet
+            document_status = None
+
+        return {
+            "account_status": account_status,
+            "document_status": document_status,
+            "document": document,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to get verification status for %s: %s", user_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve verification status.")
+
+
+@router.post(
+    "/upload-document",
+    summary="Upload verification document (public, used by IdentityVerificationPage)",
+)
+async def upload_verification_document(
+    user_id: str = Form(...),
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+):
+    try:
+        # Validate user exists
+        user = await db.get("Users", user_id)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        # Validate document_type
+        allowed_types = {"EMPLOYEE_ID", "POLICE_ID", "OTHER_GOVERNMENT_ID"}
+        if document_type not in allowed_types:
+            # accept case-insensitive
+            if document_type.upper() not in allowed_types:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document type")
+            document_type = document_type.upper()
+
+        # Allow fallback to extension check (PowerShell Form upload may send generic mime)
+        if file.content_type not in ALLOWED_MIME_TYPES:
+            ext = _Path(file.filename or "").suffix.lower()
+            if ext not in (".pdf", ".jpg", ".jpeg", ".png"):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"File type not allowed. Allowed types: PDF, JPG, JPEG, PNG")
+            # extension ok -> allow even if mime is generic like application/octet-stream or text/plain
+
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"File size exceeds limit of {MAX_FILE_SIZE // (1024*1024)}MB")
+
+        # Save file
+        storage_dir = _Path(__file__).parent.parent / "storage" / "verification_documents" / str(user_id)
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        # sanitize filename
+        orig_name = file.filename or "document"
+        # avoid path traversal
+        safe_name = _Path(orig_name).name
+        dest = storage_dir / safe_name
+        # if file exists, make unique
+        if dest.exists():
+            stem = dest.stem
+            suffix = dest.suffix
+            dest = storage_dir / f"{stem}_{int(__import__('time').time())}{suffix}"
+        dest.write_bytes(content)
+
+        # Update user status to pending_verification
+        from datetime import datetime as _dt
+        await db.update("Users", user_id, {"status": "pending_verification", "updated_at": _dt.utcnow().isoformat()})
+        await db.insert("Audit_Logs", {
+            "user_id": user_id,
+            "action": "user.document_uploaded",
+            "module": "auth",
+            "details": f"Verification document uploaded {safe_name} type {document_type}",
+            "created_at": _dt.utcnow().isoformat(),
+        })
+
+        return {"message": "Document uploaded successfully. Your account is now pending verification.", "document_id": 1, "redirect_url": "/verification-pending"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to upload verification document for %s: %s", user_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to upload document.")

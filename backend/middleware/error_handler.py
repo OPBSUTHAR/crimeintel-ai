@@ -30,9 +30,14 @@ async def http_exception_handler(
     request: Request, exc: StarletteHTTPException
 ) -> JSONResponse:
     detail = exc.detail or HTTPStatusMessages.get(exc.status_code, "An error occurred")
+    # Preserve structured detail (dict) for auth flows like pending verification -> 403 with user_id/account_status
+    if isinstance(detail, dict):
+        return JSONResponse(status_code=exc.status_code, content={"detail": detail})
+    if not isinstance(detail, str):
+        detail = str(detail)
     code = None
     for key, msg in ERROR_CODES.items():
-        if msg == detail or detail.endswith(msg.rstrip(".")):
+        if msg == detail or (isinstance(detail, str) and detail.endswith(msg.rstrip("."))):
             code = key
             break
     return _build_error_response(
