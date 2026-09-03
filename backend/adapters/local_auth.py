@@ -27,13 +27,24 @@ class LocalAuthAdapter:
     async def login(self, email: str, password: str) -> dict:
         await self._ensure_initialized()
         from adapters.sqlite_db import sqlite_db
-        users = await sqlite_db.query("Users", {"email": email})
+        # Normalize email: strip spaces, case-insensitive (fixes frontend caps/space 401)
+        email_norm = (email or "").strip().lower()
+        # Use manual scan for case-insensitive match (sqlite query is case-sensitive)
+        all_users = await sqlite_db.get_all("Users") or []
+        users = [u for u in all_users if str(u.get("email","")).strip().lower() == email_norm]
+        # fallback to direct query if scan empty (keeps old behavior for exact match)
         if not users:
+            users = await sqlite_db.query("Users", {"email": email})
+            if not users and email_norm != email:
+                users = await sqlite_db.query("Users", {"email": email_norm})
+        if not users:
+            logger.info(f"Login failed: email not found {email} -> {email_norm}")
             raise ValueError("Invalid credentials")
 
         user = users[0]
         stored_hash = user.get("password_hash", "")
         if not stored_hash or not self._verify_password(password, stored_hash):
+            logger.info(f"Login failed: password mismatch for {email_norm}")
             raise ValueError("Invalid credentials")
 
         return {
@@ -80,7 +91,9 @@ class LocalAuthAdapter:
     async def signup(self, email: str, password: str, display_name: str) -> dict:
         await self._ensure_initialized()
         from adapters.sqlite_db import sqlite_db
-        existing = await sqlite_db.query("Users", {"email": email})
+        email_norm = (email or "").strip().lower()
+        all_users = await sqlite_db.get_all("Users") or []
+        existing = [u for u in all_users if str(u.get("email","")).strip().lower() == email_norm]
         if existing:
             raise ValueError("Email already registered")
 
